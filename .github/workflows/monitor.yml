@@ -7,7 +7,11 @@ on:
   workflow_dispatch: {}   # Actions 탭에서 수동 실행 버튼도 사용 가능
 
 permissions:
-  contents: write   # seen_schedules.json 커밋을 위해 필요
+  contents: write   # 상태 파일 커밋을 위해 필요
+
+concurrency:
+  group: sunsang24-monitor   # 동시 실행 방지 (push 충돌 예방)
+  cancel-in-progress: false
 
 jobs:
   check:
@@ -23,19 +27,19 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 선상24 조회 및 텔레그램 알림
+      - name: 선상24 조회 및 텔레그램 처리
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor_sunsang24.py
 
-      - name: 상태 파일(seen_schedules.json) 저장소에 반영
+      - name: 상태 파일 저장소에 반영
         run: |
           git config user.name "sunsang24-monitor-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add seen_schedules.json
+          git add seen_schedules.json history.json config.json tg_offset.json
           if ! git diff --staged --quiet; then
-            git commit -m "update seen schedules"
+            git commit -m "update monitor state"
             git fetch origin main
             git rebase origin/main
             git push
