@@ -1,0 +1,7 @@
+{
+ "sdate": "2026-09-19,2026-09-20",
+ "min_seats": 2,
+ "min_start_hour": 12,
+ "max_start_hour": 19,
+ "min_board_count": 10
+}
