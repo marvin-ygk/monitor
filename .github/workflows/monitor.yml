@@ -2,7 +2,7 @@ name: sunsang24-monitor
 
 on:
   schedule:
-    # 5분마다 실행 (GitHub 서버 부하에 따라 몇 분 지연될 수 있습니다)
+    # 5분마다 실행 (GitHub 서버 사정에 따라 지연될 수 있습니다)
     - cron: "*/5 * * * *"
   workflow_dispatch: {}   # Actions 탭에서 수동 실행 버튼도 사용 가능
 
@@ -10,7 +10,7 @@ permissions:
   contents: write   # 상태 파일 커밋을 위해 필요
 
 concurrency:
-  group: sunsang24-monitor   # 동시 실행 방지 (push 충돌 예방)
+  group: sunsang24-monitor   # 동시 실행 방지
   cancel-in-progress: false
 
 jobs:
@@ -27,20 +27,16 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 선상24 조회 및 텔레그램 처리
+      - name: 낚시배 조회 및 텔레그램 처리
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor_sunsang24.py
 
       - name: 상태 파일 저장소에 반영
+        # 상태 저장이 실패하면 중복 알림이 발생하므로, 충돌 시 여러 번 재시도한다
         run: |
           git config user.name "sunsang24-monitor-bot"
           git config user.email "actions@users.noreply.github.com"
           git add seen_schedules.json history.json config.json tg_offset.json
-          if ! git diff --staged --quiet; then
-            git commit -m "update monitor state"
-            git fetch origin main
-            git rebase origin/main
-            git push
-          fi
+          if git diff --staged --quiet;
