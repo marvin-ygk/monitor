@@ -12,6 +12,7 @@ GitHub Actions에서 5분마다 실행되는 것을 전제로 합니다.
 """
 import json
 import os
+import re
 import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,13 @@ HISTORY_FILE = os.path.join(BASE_DIR, "history.json")      # 조회 이력
 OFFSET_FILE = os.path.join(BASE_DIR, "tg_offset.json")     # 텔레그램 메시지 읽은 위치
 
 API_URL = "https://api.sunsang24.com/ship/list"
+
+# 더피싱(thefishing.kr) 검색 URL과 고정 조건
+# sf[]=1 선상배낚시 / si[]=3 주꾸미 / sa[]=4 경기도, sa[]=5 충청남도
+TF_URL = ("https://thefishing.kr/reservation/list.php"
+          "?sf%5B%5D=1&si%5B%5D=3&sa%5B%5D=4&sa%5B%5D=5"
+          "&search_1=&search_2=&search_date={date}&search_in=")
+
 KST = timezone(timedelta(hours=9))
 
 DEFAULT_CONFIG = {
@@ -132,6 +140,65 @@ def fetch_listings(sdate):
         return json.load(resp).get("list", [])
 
 
+def fetch_thefishing(date):
+    """더피싱에서 해당 날짜에 예약 가능한 배 목록을 가져온다.
+
+    이 사이트는 JSON API가 아니라 HTML을 돌려주므로, 검색 결과 영역
+    (div.re_list.re_list_etc)의 각 항목에서 배 이름/지역/어종을 뽑아낸다.
+    목록에 뜬다는 것 자체가 '예약 가능'을 뜻하므로 잔여 좌석은 따로 없다.
+    """
+    req = urllib.request.Request(TF_URL.format(date=date),
+                                 headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+
+    # 검색 결과 영역만 잘라낸다 (그 위의 광고성 '더피싱패밀리' 목록 제외)
+    idx = html.find('re_list re_list_etc')
+    if idx == -1:
+        return []
+    section = html[idx:]
+
+    def strip_tags(t):
+        t = re.sub(r"<[^>]+>", " ", t)
+        t = t.replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&")
+        t = t.replace("&nbsp;", " ").replace("&quot;", '"')
+        return " ".join(t.split())
+
+    results = []
+    for block in section.split("<li")[1:]:
+        name = re.search(r'class="re_list_ship"[^>]*>(.*?)</div>', block, re.S)
+        if not name:
+            continue
+        area = re.search(r'class="re_list_area"[^>]*>(.*?)</div>', block, re.S)
+        fish = re.search(r'class="re_list_fish"[^>]*>(.*?)</div>', block, re.S)
+        cap = re.search(r'class="re_list_price"[^>]*>(.*?)</div>', block, re.S)
+        link = re.search(r'href="([^"]*?list\.php\?uid=\d+)"', block)
+        url = link.group(1) if link else ""
+        if url.startswith("/"):
+            url = "https://thefishing.kr" + url
+        results.append({
+            "name": strip_tags(name.group(1)),
+            "area": strip_tags(area.group(1)) if area else "",
+            "fish": strip_tags(fish.group(1)) if fish else "",
+            "capacity": strip_tags(cap.group(1)) if cap else "",
+            "url": url,
+            "date": date,
+        })
+    return results
+
+
+def tf_describe(item):
+    msg = (f"- {item['name']} ({item['area']})\n"
+           f"  {item['date']} / {item['fish']} / {item['capacity']}")
+    if item.get("url"):
+        msg += f"\n  {item['url']}"
+    return msg
+
+
+def tf_key(item):
+    return f"TF|{item['date']}|{item['name']}"
+
+
 def start_hour(item):
     try:
         return int((item.get("stime") or "23:59:00").split(":")[0])
@@ -151,13 +218,20 @@ def matches(item, cfg):
     return True
 
 
+def ship_url(item):
+    """선상24 해당 배의 예약 페이지 주소"""
+    return (f"https://www.sunsang24.com/ship/list/"
+            f"?ship_no={item['ship'].get('no','')}&sdate={item.get('sdate','')}")
+
+
 def describe(item):
     return (
         f"- {item['ship']['name']} ({item.get('port_name','')})\n"
         f"  {item.get('sdate','')} {(item.get('stime') or '')[:5]}~{(item.get('etime') or '')[:5]}"
         f" / 남은자리 {item.get('remain_embarkation_num',0)}명"
         f" / 조황 {item.get('board_write_num',0)}건"
-        f" / 인당 {item.get('price',0):,}원"
+        f" / 인당 {item.get('price',0):,}원\n"
+        f"  {ship_url(item)}"
     )
 
 
@@ -178,13 +252,14 @@ def now_kst():
 
 HELP_TEXT = (
     "🎣 사용 가능한 명령어\n\n"
-    "/status - 현재 설정 + 지금 조건에 맞는 배 보기\n"
+    "/status - 현재 설정 + 지금 조건에 맞는 배 보기 (선상24 + 더피싱)\n"
     "/all - 조건 무시하고 자리 있는 배 전부 보기\n"
     "/history - 최근 조회 이력 보기\n"
     "/date 2026-09-26,2026-09-27 - 감시 날짜 변경\n"
     "/seats 2 - 최소 인원 변경\n"
     "/hours 12 19 - 출항 시간대 변경 (12시~19시)\n"
     "/board 10 - 최소 조황정보 건수 변경\n"
+    "/ping - 봇이 살아있는지 확인 (직전 실행 시각)\n"
     "/help - 이 도움말\n\n"
     "※ 5분마다 실행되므로 명령 후 응답까지 최대 5~15분 걸릴 수 있습니다."
 )
@@ -199,6 +274,14 @@ def handle_command(text, cfg):
     if cmd == "/help":
         return HELP_TEXT, False
 
+    if cmd == "/ping":
+        hist = load_json(HISTORY_FILE, [])
+        last = hist[-1]["time"] if hist else "기록 없음"
+        return (f"✅ 모니터링 정상 작동 중\n"
+                f"현재 시각: {now_kst()}\n"
+                f"직전 실행: {last}\n"
+                f"누적 실행 기록: {len(hist)}회"), False
+
     if cmd == "/status":
         try:
             items = fetch_listings(cfg["sdate"])
@@ -206,10 +289,22 @@ def handle_command(text, cfg):
             return f"조회 실패: {e}", False
         hits = [i for i in items if matches(i, cfg)]
         msg = f"📋 현재 설정\n{config_text(cfg)}\n\n"
+        msg += "[선상24]\n"
         if hits:
             msg += f"조건에 맞는 배 {len(hits)}건:\n" + "\n".join(describe(i) for i in hits)
         else:
             msg += "조건에 맞는 배가 현재 없습니다."
+        msg += "\n\n[더피싱]\n"
+        tf_all = []
+        for d in cfg["sdate"].split(","):
+            try:
+                tf_all += fetch_thefishing(d.strip())
+            except Exception as e:
+                msg += f"{d.strip()} 조회 실패: {e}\n"
+        if tf_all:
+            msg += f"예약 가능한 배 {len(tf_all)}건:\n" + "\n".join(tf_describe(i) for i in tf_all)
+        else:
+            msg += "예약 가능한 배가 현재 없습니다."
         return msg, False
 
     if cmd == "/all":
@@ -222,10 +317,27 @@ def handle_command(text, cfg):
                  and i.get("remain_embarkation_num", 0) >= 1]
         avail.sort(key=lambda i: (i.get("sdate", ""), i.get("stime", "")))
         if not avail:
-            return f"[{cfg['sdate']}] 자리 있는 배가 하나도 없습니다.", False
-        msg = f"🔎 자리 있는 배 전체 {len(avail)}건 ({cfg['sdate']})\n"
+            tf_all = []
+            for d in cfg["sdate"].split(","):
+                try:
+                    tf_all += fetch_thefishing(d.strip())
+                except Exception:
+                    pass
+            m = f"[선상24] {cfg['sdate']} 자리 있는 배가 없습니다.\n\n"
+            m += f"[더피싱] 예약 가능한 배 {len(tf_all)}건\n"
+            m += "\n".join(tf_describe(i) for i in tf_all) if tf_all else "없음"
+            return m, False
+        msg = f"🔎 [선상24] 자리 있는 배 {len(avail)}건 ({cfg['sdate']})\n"
         msg += "(조건 무시, 1자리 이상 전부)\n\n"
         msg += "\n".join(describe(i) for i in avail)
+        tf_all = []
+        for d in cfg["sdate"].split(","):
+            try:
+                tf_all += fetch_thefishing(d.strip())
+            except Exception:
+                pass
+        msg += f"\n\n🔎 [더피싱] 예약 가능한 배 {len(tf_all)}건\n"
+        msg += "\n".join(tf_describe(i) for i in tf_all) if tf_all else "없음"
         return msg, False
 
     if cmd == "/history":
@@ -234,7 +346,9 @@ def handle_command(text, cfg):
             return "아직 조회 이력이 없습니다.", False
         msg = f"📊 최근 조회 이력 (최근 {len(hist)}회)\n\n"
         for h in reversed(hist[-15:]):
-            msg += f"{h['time']} - 조건충족 {h['matched']}건 / 자리있음 {h['available']}건"
+            msg += (f"{h['time']} - 선상24 조건충족 {h['matched']}건"
+                    f" / 자리있음 {h['available']}건"
+                    f" / 더피싱 {h.get('tf', 0)}건")
             if h.get("notified"):
                 msg += f" / 🔔알림 {h['notified']}건"
             msg += "\n"
@@ -312,26 +426,41 @@ def main():
                  if i.get("schedule_status_code") == "ING"
                  and i.get("remain_embarkation_num", 0) >= 1]
 
+    # 더피싱도 함께 조회 (목록에 뜨면 예약 가능하다는 뜻)
+    tf_items = []
+    for d in cfg["sdate"].split(","):
+        try:
+            tf_items += fetch_thefishing(d.strip())
+        except Exception as e:
+            print(f"더피싱 조회 실패({d.strip()}): {e}")
+
     seen = set(load_json(SEEN_FILE, []))
     new_items = [i for i in hits if str(i["schedule_no"]) not in seen]
+    tf_new = [i for i in tf_items if tf_key(i) not in seen]
 
-    if new_items:
-        msg = "🎣 조건에 맞는 새 낚시배가 나왔습니다!\n\n"
-        msg += "\n".join(describe(i) for i in new_items)
+    if new_items or tf_new:
+        msg = "🎣 조건에 맞는 새 낚시배가 나왔습니다!\n"
+        if new_items:
+            msg += "\n[선상24]\n" + "\n".join(describe(i) for i in new_items)
+        if tf_new:
+            msg += "\n[더피싱]\n" + "\n".join(tf_describe(i) for i in tf_new)
         tg_send(msg)
-        print(f"알림 전송: {len(new_items)}건")
+        print(f"알림 전송: 선상24 {len(new_items)}건 / 더피싱 {len(tf_new)}건")
     else:
         print("새 항목 없음")
 
     # 3) 상태 저장
-    save_json(SEEN_FILE, sorted(seen | {str(i["schedule_no"]) for i in hits}))
+    seen |= {str(i["schedule_no"]) for i in hits}
+    seen |= {tf_key(i) for i in tf_items}
+    save_json(SEEN_FILE, sorted(seen))
 
     hist = load_json(HISTORY_FILE, [])
     hist.append({
         "time": now_kst(),
         "matched": len(hits),
         "available": len(available),
-        "notified": len(new_items),
+        "tf": len(tf_items),
+        "notified": len(new_items) + len(tf_new),
     })
     save_json(HISTORY_FILE, hist[-HISTORY_MAX:])
 
