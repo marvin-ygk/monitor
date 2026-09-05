@@ -2,15 +2,14 @@ name: sunsang24-monitor
 
 on:
   schedule:
-    # 5분마다 실행 (GitHub 서버 사정에 따라 지연될 수 있습니다)
     - cron: "*/5 * * * *"
-  workflow_dispatch: {}   # Actions 탭에서 수동 실행 버튼도 사용 가능
+  workflow_dispatch: {}
 
 permissions:
-  contents: write   # 상태 파일 커밋을 위해 필요
+  contents: write
 
 concurrency:
-  group: sunsang24-monitor   # 동시 실행 방지
+  group: sunsang24-monitor
   cancel-in-progress: false
 
 jobs:
@@ -34,9 +33,11 @@ jobs:
         run: python monitor_sunsang24.py
 
       - name: 상태 파일 저장소에 반영
-        # 상태 저장이 실패하면 중복 알림이 발생하므로, 충돌 시 여러 번 재시도한다
         run: |
           git config user.name "sunsang24-monitor-bot"
           git config user.email "actions@users.noreply.github.com"
           git add seen_schedules.json history.json config.json tg_offset.json
-          if git diff --staged --quiet;
+          if git diff --staged --quiet; then echo "변경 없음"; exit 0; fi
+          git commit -m "update monitor state"
+          for i in 1 2 3 4 5; do git fetch origin main; if git rebase origin/main && git push; then echo "저장 완료"; exit 0; fi; git rebase --abort || true; sleep 5; done
+          echo "상태 저장 실패"; exit 1
