@@ -3,13 +3,6 @@
   "time": "09-06 16:10",
   "matched": 1,
   "available": 6,
-  "tf": 1,
-  "notified": 0
- },
- {
-  "time": "09-06 16:10",
-  "matched": 1,
-  "available": 6,
   "tf": 0,
   "notified": 0
  },
@@ -207,6 +200,13 @@
   "matched": 0,
   "available": 5,
   "tf": 2,
+  "notified": 0
+ },
+ {
+  "time": "09-06 20:51",
+  "matched": 0,
+  "available": 6,
+  "tf": 0,
   "notified": 0
  }
 ]
