@@ -1,6 +1,6 @@
 {
- "sdate": "2026-10-03,2026-10-04",
- "min_seats": 2,
+ "sdate": "2026-10-03",
+ "min_seats": 3,
  "min_start_hour": 5,
  "max_start_hour": 19,
  "min_board_count": 10
