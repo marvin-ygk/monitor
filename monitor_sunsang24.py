@@ -172,16 +172,14 @@ def fetch_thefishing(date):
         area = re.search(r'class="re_list_area"[^>]*>(.*?)</div>', block, re.S)
         fish = re.search(r'class="re_list_fish"[^>]*>(.*?)</div>', block, re.S)
         cap = re.search(r'class="re_list_price"[^>]*>(.*?)</div>', block, re.S)
-        link = re.search(r'href="([^"]*?list\.php\?uid=\d+)"', block)
-        url = link.group(1) if link else ""
-        if url.startswith("/"):
-            url = "https://thefishing.kr" + url
         results.append({
             "name": strip_tags(name.group(1)),
             "area": strip_tags(area.group(1)) if area else "",
             "fish": strip_tags(fish.group(1)) if fish else "",
             "capacity": strip_tags(cap.group(1)) if cap else "",
-            "url": url,
+            # 더피싱은 원본 HTML에 배별 링크가 없고 자바스크립트로 만들어지므로,
+            # 그 날짜의 검색 결과 페이지 주소를 대신 넣는다.
+            "url": TF_URL.format(date=date),
             "date": date,
         })
     return results
@@ -237,10 +235,10 @@ def describe(item):
 
 def config_text(cfg):
     return (
-        f"감시 날짜: {cfg['sdate']}\n"
-        f"최소 인원: {cfg['min_seats']}명\n"
-        f"출항 시간대: {cfg['min_start_hour']}시~{cfg['max_start_hour']}시\n"
-        f"최소 조황정보: {cfg['min_board_count']}건"
+        f"감시 날짜: {cfg['sdate']} (선상24+더피싱)\n"
+        f"최소 인원: {cfg['min_seats']}명 (선상24만)\n"
+        f"출항 시간대: {cfg['min_start_hour']}시~{cfg['max_start_hour']}시 (선상24만)\n"
+        f"최소 조황정보: {cfg['min_board_count']}건 (선상24만)"
     )
 
 
@@ -358,26 +356,33 @@ def handle_command(text, cfg):
         if not args:
             return "사용법: /date 2026-09-26,2026-09-27", False
         cfg["sdate"] = args[0]
-        return f"감시 날짜를 {args[0]} 로 변경했습니다.", True
+        return (f"감시 날짜를 {args[0]} 로 변경했습니다.\n\n"
+                f"현재 설정\n{config_text(cfg)}"), True
 
     if cmd == "/seats":
         if not args or not args[0].isdigit():
             return "사용법: /seats 2", False
         cfg["min_seats"] = int(args[0])
-        return f"최소 인원을 {args[0]}명으로 변경했습니다.", True
+        return (f"최소 인원을 {args[0]}명으로 변경했습니다.\n"
+                f"(선상24에만 적용됩니다. 더피싱은 잔여 좌석을 공개하지 않습니다)\n\n"
+                f"현재 설정\n{config_text(cfg)}"), True
 
     if cmd == "/hours":
         if len(args) < 2 or not args[0].isdigit() or not args[1].isdigit():
             return "사용법: /hours 12 19  (12시~19시 출항)", False
         cfg["min_start_hour"] = int(args[0])
         cfg["max_start_hour"] = int(args[1])
-        return f"출항 시간대를 {args[0]}시~{args[1]}시로 변경했습니다.", True
+        return (f"출항 시간대를 {args[0]}시~{args[1]}시로 변경했습니다.\n"
+                f"(선상24에만 적용됩니다)\n\n"
+                f"현재 설정\n{config_text(cfg)}"), True
 
     if cmd == "/board":
         if not args or not args[0].isdigit():
             return "사용법: /board 10", False
         cfg["min_board_count"] = int(args[0])
-        return f"최소 조황정보 건수를 {args[0]}건으로 변경했습니다.", True
+        return (f"최소 조황정보 건수를 {args[0]}건으로 변경했습니다.\n"
+                f"(선상24에만 적용됩니다)\n\n"
+                f"현재 설정\n{config_text(cfg)}"), True
 
     return None, False  # 모르는 명령은 무시
 
