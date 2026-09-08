@@ -45,6 +45,10 @@ TF_URL = ("https://thefishing.kr/reservation/list.php"
           "?sf%5B%5D=1&si%5B%5D=3&sa%5B%5D=4&sa%5B%5D=5"
           "&search_1=&search_2=&search_date={date}&search_in=")
 
+# 클럽씨피싱(clubsea.co.kr) — 충남 홍성 남당항 선단 자체 예약 사이트
+# 한 번 요청하면 그 달 전체가 내려오므로, 월 단위로 조회한 뒤 날짜로 걸러낸다.
+CS_URL = "https://www.clubsea.co.kr/reservation?price_search=&search_date={ym}&day={dd}"
+
 KST = timezone(timedelta(hours=9))
 
 DEFAULT_CONFIG = {
@@ -197,6 +201,62 @@ def tf_key(item):
     return f"TF|{item['date']}|{item['name']}"
 
 
+def fetch_clubsea(date):
+    """클럽씨피싱에서 해당 날짜에 자리가 남은 배 목록을 가져온다.
+
+    응답에 그 달 전체가 담겨 오므로 날짜로 걸러낸다.
+    잔여 좌석이 숫자로 표시되므로 인원 조건을 적용할 수 있다.
+    ※ 이 사이트는 예약자 실명이 화면에 노출되지만, 여기서는 배 이름과
+      어종, 잔여 좌석만 가져오고 예약자 정보는 일절 수집하지 않는다.
+    """
+    ym, dd = date[:7], date[8:10]
+    req = urllib.request.Request(CS_URL.format(ym=ym, dd=dd),
+                                 headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+
+    def strip_tags(t):
+        t = re.sub(r"<[^>]+>", " ", t)
+        t = t.replace("&nbsp;", " ").replace("&amp;", "&")
+        return " ".join(t.split())
+
+    results = []
+    for row in html.split("<tr")[1:]:
+        seat_m = re.search(r'class="reservation_count[^"]*"[^>]*>(.*?)</span>', row, re.S)
+        if not seat_m:
+            continue
+        row_date_m = re.search(r"20\d\d-\d{2}-\d{2}", row)
+        if not row_date_m or row_date_m.group(0) != date:
+            continue
+        seat_txt = strip_tags(seat_m.group(1))
+        num_m = re.match(r"(\d+)명", seat_txt)
+        if not num_m:          # '예약완료' 등은 제외
+            continue
+        name_m = re.search(r"<td[^>]*>((?:(?!<td)[\s\S])*?)<button", row)
+        if not name_m:
+            name_m = re.search(r"<td[^>]*>((?:(?!<td)[\s\S])*?)<a\b", row)
+        fish_m = re.search(r"공지\s*</span>\s*([^<]{1,60})", row)
+        results.append({
+            "name": strip_tags(name_m.group(1)) if name_m else "(이름 확인 불가)",
+            "fish": strip_tags(fish_m.group(1)) if fish_m else "",
+            "seats": int(num_m.group(1)),
+            # 예약하기가 팝업으로 열려 주소가 바뀌지 않으므로, 그 날짜 목록 주소를 넣는다
+            "url": CS_URL.format(ym=ym, dd=dd),
+            "date": date,
+        })
+    return results
+
+
+def cs_describe(item):
+    return (f"- {item['name']}\n"
+            f"  {item['date']} / {item['fish']} / 남은자리 {item['seats']}명\n"
+            f"  {item['url']}")
+
+
+def cs_key(item):
+    return f"CS|{item['date']}|{item['name']}"
+
+
 def start_hour(item):
     try:
         return int((item.get("stime") or "23:59:00").split(":")[0])
@@ -217,9 +277,10 @@ def matches(item, cfg):
 
 
 def ship_url(item):
-    """선상24 해당 배의 예약 페이지 주소"""
-    return (f"https://www.sunsang24.com/ship/list/"
-            f"?ship_no={item['ship'].get('no','')}&sdate={item.get('sdate','')}")
+    """선상24: 예약하기 버튼을 누른 상태(인원 선택 화면)로 바로 가는 주소"""
+    return ("https://www.sunsang24.com/mypage/reservation_ready/"
+            f"{item['ship'].get('no','')}/{item.get('schedule_no','')}/"
+            f"{item.get('sdate','')}/")
 
 
 def describe(item):
@@ -235,8 +296,8 @@ def describe(item):
 
 def config_text(cfg):
     return (
-        f"감시 날짜: {cfg['sdate']} (선상24+더피싱)\n"
-        f"최소 인원: {cfg['min_seats']}명 (선상24만)\n"
+        f"감시 날짜: {cfg['sdate']} (3개 사이트 공통)\n"
+        f"최소 인원: {cfg['min_seats']}명 (선상24+클럽씨피싱)\n"
         f"출항 시간대: {cfg['min_start_hour']}시~{cfg['max_start_hour']}시 (선상24만)\n"
         f"최소 조황정보: {cfg['min_board_count']}건 (선상24만)"
     )
@@ -303,6 +364,18 @@ def handle_command(text, cfg):
             msg += f"예약 가능한 배 {len(tf_all)}건:\n" + "\n".join(tf_describe(i) for i in tf_all)
         else:
             msg += "예약 가능한 배가 현재 없습니다."
+        msg += "\n\n[클럽씨피싱]\n"
+        cs_all = []
+        for d in cfg["sdate"].split(","):
+            try:
+                cs_all += [i for i in fetch_clubsea(d.strip())
+                           if i["seats"] >= cfg["min_seats"]]
+            except Exception as e:
+                msg += f"{d.strip()} 조회 실패: {e}\n"
+        if cs_all:
+            msg += f"조건에 맞는 배 {len(cs_all)}건:\n" + "\n".join(cs_describe(i) for i in cs_all)
+        else:
+            msg += "조건에 맞는 배가 현재 없습니다."
         return msg, False
 
     if cmd == "/all":
@@ -321,9 +394,17 @@ def handle_command(text, cfg):
                     tf_all += fetch_thefishing(d.strip())
                 except Exception:
                     pass
+            cs_all = []
+            for d in cfg["sdate"].split(","):
+                try:
+                    cs_all += fetch_clubsea(d.strip())
+                except Exception:
+                    pass
             m = f"[선상24] {cfg['sdate']} 자리 있는 배가 없습니다.\n\n"
             m += f"[더피싱] 예약 가능한 배 {len(tf_all)}건\n"
-            m += "\n".join(tf_describe(i) for i in tf_all) if tf_all else "없음"
+            m += ("\n".join(tf_describe(i) for i in tf_all) if tf_all else "없음")
+            m += f"\n\n[클럽씨피싱] 자리 있는 배 {len(cs_all)}건\n"
+            m += ("\n".join(cs_describe(i) for i in cs_all) if cs_all else "없음")
             return m, False
         msg = f"🔎 [선상24] 자리 있는 배 {len(avail)}건 ({cfg['sdate']})\n"
         msg += "(조건 무시, 1자리 이상 전부)\n\n"
@@ -336,6 +417,14 @@ def handle_command(text, cfg):
                 pass
         msg += f"\n\n🔎 [더피싱] 예약 가능한 배 {len(tf_all)}건\n"
         msg += "\n".join(tf_describe(i) for i in tf_all) if tf_all else "없음"
+        cs_all = []
+        for d in cfg["sdate"].split(","):
+            try:
+                cs_all += fetch_clubsea(d.strip())
+            except Exception:
+                pass
+        msg += f"\n\n🔎 [클럽씨피싱] 자리 있는 배 {len(cs_all)}건\n"
+        msg += "\n".join(cs_describe(i) for i in cs_all) if cs_all else "없음"
         return msg, False
 
     if cmd == "/history":
@@ -346,7 +435,8 @@ def handle_command(text, cfg):
         for h in reversed(hist[-15:]):
             msg += (f"{h['time']} - 선상24 조건충족 {h['matched']}건"
                     f" / 자리있음 {h['available']}건"
-                    f" / 더피싱 {h.get('tf', 0)}건")
+                    f" / 더피싱 {h.get('tf', 0)}건"
+                    f" / 클럽씨 {h.get('cs', 0)}건")
             if h.get("notified"):
                 msg += f" / 🔔알림 {h['notified']}건"
             msg += "\n"
@@ -364,7 +454,7 @@ def handle_command(text, cfg):
             return "사용법: /seats 2", False
         cfg["min_seats"] = int(args[0])
         return (f"최소 인원을 {args[0]}명으로 변경했습니다.\n"
-                f"(선상24에만 적용됩니다. 더피싱은 잔여 좌석을 공개하지 않습니다)\n\n"
+                f"(선상24·클럽씨피싱에 적용됩니다. 더피싱은 잔여 좌석을 공개하지 않습니다)\n\n"
                 f"현재 설정\n{config_text(cfg)}"), True
 
     if cmd == "/hours":
@@ -439,24 +529,37 @@ def main():
         except Exception as e:
             print(f"더피싱 조회 실패({d.strip()}): {e}")
 
+    # 클럽씨피싱 (잔여 좌석이 숫자로 나오므로 인원 조건 적용)
+    cs_items = []
+    for d in cfg["sdate"].split(","):
+        try:
+            cs_items += [i for i in fetch_clubsea(d.strip())
+                         if i["seats"] >= cfg["min_seats"]]
+        except Exception as e:
+            print(f"클럽씨피싱 조회 실패({d.strip()}): {e}")
+
     seen = set(load_json(SEEN_FILE, []))
     new_items = [i for i in hits if str(i["schedule_no"]) not in seen]
     tf_new = [i for i in tf_items if tf_key(i) not in seen]
+    cs_new = [i for i in cs_items if cs_key(i) not in seen]
 
-    if new_items or tf_new:
+    if new_items or tf_new or cs_new:
         msg = "🎣 조건에 맞는 새 낚시배가 나왔습니다!\n"
         if new_items:
             msg += "\n[선상24]\n" + "\n".join(describe(i) for i in new_items)
         if tf_new:
             msg += "\n[더피싱]\n" + "\n".join(tf_describe(i) for i in tf_new)
+        if cs_new:
+            msg += "\n[클럽씨피싱]\n" + "\n".join(cs_describe(i) for i in cs_new)
         tg_send(msg)
-        print(f"알림 전송: 선상24 {len(new_items)}건 / 더피싱 {len(tf_new)}건")
+        print(f"알림: 선상24 {len(new_items)} / 더피싱 {len(tf_new)} / 클럽씨 {len(cs_new)}")
     else:
         print("새 항목 없음")
 
     # 3) 상태 저장
     seen |= {str(i["schedule_no"]) for i in hits}
     seen |= {tf_key(i) for i in tf_items}
+    seen |= {cs_key(i) for i in cs_items}
     save_json(SEEN_FILE, sorted(seen))
 
     hist = load_json(HISTORY_FILE, [])
@@ -465,7 +568,8 @@ def main():
         "matched": len(hits),
         "available": len(available),
         "tf": len(tf_items),
-        "notified": len(new_items) + len(tf_new),
+        "cs": len(cs_items),
+        "notified": len(new_items) + len(tf_new) + len(cs_new),
     })
     save_json(HISTORY_FILE, hist[-HISTORY_MAX:])
 
