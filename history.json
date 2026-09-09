@@ -3,14 +3,6 @@
   "time": "09-10 05:01",
   "matched": 0,
   "available": 6,
-  "tf": 0,
-  "cs": 0,
-  "notified": 0
- },
- {
-  "time": "09-10 05:01",
-  "matched": 0,
-  "available": 6,
   "tf": 1,
   "cs": 0,
   "notified": 0
@@ -236,6 +228,14 @@
   "matched": 0,
   "available": 6,
   "tf": 0,
+  "cs": 0,
+  "notified": 0
+ },
+ {
+  "time": "09-10 07:25",
+  "matched": 0,
+  "available": 6,
+  "tf": 1,
   "cs": 0,
   "notified": 0
  }
