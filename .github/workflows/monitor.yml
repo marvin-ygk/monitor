@@ -2,7 +2,7 @@ name: sunsang24-monitor
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -15,6 +15,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: 저장소 체크아웃
         uses: actions/checkout@v7
@@ -27,6 +28,7 @@ jobs:
           python-version: "3.11"
 
       - name: 낚시배 조회 및 텔레그램 처리
+        timeout-minutes: 3
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
