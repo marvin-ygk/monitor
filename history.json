@@ -1,13 +1,5 @@
 [
  {
-  "time": "09-21 08:41",
-  "matched": 2,
-  "available": 5,
-  "tf": 0,
-  "cs": 0,
-  "notified": 0
- },
- {
   "time": "09-21 10:42",
   "matched": 2,
   "available": 5,
@@ -236,6 +228,14 @@
   "matched": 13,
   "available": 18,
   "tf": 0,
+  "cs": 0,
+  "notified": 0
+ },
+ {
+  "time": "09-26 09:00",
+  "matched": 13,
+  "available": 17,
+  "tf": 2,
   "cs": 0,
   "notified": 0
  }
