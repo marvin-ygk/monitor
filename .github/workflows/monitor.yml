@@ -1,8 +1,8 @@
 name: sunsang24-monitor
 
+# 예약 실행(schedule)은 쓰지 않습니다. cron-job.org 가 10분마다 실행시키고,
+# 필요하면 Actions 탭에서 수동으로 실행할 수 있습니다.
 on:
-  schedule:
-    - cron: "*/10 * * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
       - name: 저장소 체크아웃
         uses: actions/checkout@v7
@@ -27,18 +27,22 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: 암호화 라이브러리 설치
+        run: pip install --quiet cryptography==43.0.3
+
       - name: 낚시배 조회 및 텔레그램 처리
-        timeout-minutes: 3
+        timeout-minutes: 4
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
+          STATE_KEY: ${{ secrets.STATE_KEY }}
         run: python monitor_sunsang24.py
 
-      - name: 상태 파일 저장소에 반영
+      - name: 암호화된 상태 파일 저장
         run: |
           git config user.name "sunsang24-monitor-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add seen_schedules.json history.json config.json tg_offset.json
+          git add state.enc
           if git diff --staged --quiet; then echo "변경 없음"; exit 0; fi
           git commit -m "update monitor state"
           for i in 1 2 3 4 5; do git fetch origin main; if git rebase origin/main && git push; then echo "저장 완료"; exit 0; fi; git rebase --abort || true; sleep 5; done
