@@ -45,6 +45,9 @@ HEALTH_ALERT_AFTER = 3    # 연속 몇 회 이상 이상하면 관리자에게 �
 HISTORY_MAX = 50
 TIME_BUDGET = 120         # 초. 이 시간이 지나면 새 조회를 멈춤 (실행 밀림 방지)
 DEFAULT_BOARD = 10        # 선상24 최소 조황정보 건수 기본값
+TF_TIMEOUT = 45           # 더피싱 응답 대기 시간(초). 진단 기간에 20초 → 45초로 늘림
+TF_INTERVAL_DEFAULT = 30  # 더피싱 조회 간격(분). 반복 접속을 줄이기 위해 10분보다 길게
+TF_DIAG_MAX = 300         # 더피싱 진단 기록 보관 개수
 
 UA = {"User-Agent": "Mozilla/5.0"}
 START = time.time()
@@ -144,6 +147,22 @@ def out_of_time():
     return time.time() - START > TIME_BUDGET
 
 
+def err_text(e):
+    """로그용 오류 문구. 종류와 원인만 담고 주소·개인정보는 넣지 않는다."""
+    reason = getattr(e, "reason", None)
+    if reason is None:
+        reason = getattr(e, "code", None) or str(e)
+    return f"{type(e).__name__}: {str(reason)[:120]}"
+
+
+def my_ip():
+    """실행 서버(GitHub)의 공인 IP. 진단용이며 개인정보가 아니다."""
+    try:
+        return http_get("https://api.ipify.org", timeout=8).strip()[:45]
+    except Exception:
+        return "?"
+
+
 def http_get(url, timeout=20):
     req = urllib.request.Request(url, headers=UA)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -182,6 +201,8 @@ def new_state():
         "health": {},       # 사이트 -> {"bad": 연속 이상 횟수, "alerted": bool}
         "history": [],
         "ss_area_cache": None,
+        "tf": {"enabled": True, "interval": TF_INTERVAL_DEFAULT, "last": 0},
+        "tf_diag": [],      # 더피싱 진단 기록 (시각·성공여부·소요시간·서버IP·원인)
     }
 
 
@@ -261,13 +282,14 @@ def tg_call(method, params):
         with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=20) as r:
             return json.load(r)
     except Exception as e:
-        log(f"텔레그램 {method} 실패: {type(e).__name__}")
+        log(f"텔레그램 {method} 실패: {err_text(e)}")
         return None
 
 
 def tg_send(chat_id, text):
+    """메시지를 보내고, 모든 조각이 전송됐으면 True 를 돌려준다."""
     if not chat_id:
-        return
+        return False
     # 텔레그램 메시지 최대 4096자 → 나눠서 보냄
     chunks, buf = [], ""
     for line in text.split("\n"):
@@ -277,10 +299,13 @@ def tg_send(chat_id, text):
         buf += line + "\n"
     if buf.strip():
         chunks.append(buf)
+    ok = True
     for c in chunks:
-        tg_call("sendMessage", {"chat_id": chat_id, "text": c,
-                                "disable_web_page_preview": "true"})
+        res = tg_call("sendMessage", {"chat_id": chat_id, "text": c,
+                                      "disable_web_page_preview": "true"})
+        ok = ok and bool(res and res.get("ok"))
         time.sleep(0.05)
+    return ok
 
 
 def tg_updates(st):
@@ -308,6 +333,13 @@ class Fetcher:
         self.ok = {"선상24": 0, "더피싱": 0, "클럽씨피싱": 0}
         self.calls = 0
         self.ss_areas = None
+        # 더피싱: 30분 간격으로만 조회. 이번 실행에서 조회할 차례인지 판단
+        tf = st["tf"]
+        self.tf_due = tf["enabled"] and (time.time() - tf.get("last", 0) >= tf["interval"] * 60 - 30)
+        self.tf_force = False   # /status 처럼 사용자가 직접 요청하면 간격과 무관하게 조회
+        self.tf_down = False    # 이번 실행에서 한 번 실패하면 나머지 더피싱 조회는 건너뜀
+        self.tf_tried = False
+        self.ip = None
 
     # ── 선상24 지역표 (사이트에서 직접 받아옴) ──
     def ss_area_table(self):
@@ -326,7 +358,7 @@ class Fetcher:
                         table["sub"].setdefault(norm_place(i["name"]), []).append(str(i["no"]))
             self.st["ss_area_cache"] = table
         except Exception as e:
-            log(f"선상24 지역표 조회 실패: {type(e).__name__} (이전 표 사용)")
+            log(f"선상24 지역표 조회 실패: {err_text(e)} (이전 표 사용)")
             table = self.st.get("ss_area_cache") or {"sido": {}, "sub": {}}
         self.ss_areas = table
         return table
@@ -365,7 +397,7 @@ class Fetcher:
                     break
             self.ok["선상24"] += 1
         except Exception as e:
-            log(f"선상24 조회 실패: {type(e).__name__}")
+            log(f"선상24 조회 실패: {err_text(e)}")
             self.fail["선상24"] += 1
             self.cache[key] = None
             return None
@@ -404,18 +436,42 @@ class Fetcher:
             q += [("page", str(page))]
         return TF_LIST + "?" + urllib.parse.urlencode(q)
 
+    def tf_skipped(self):
+        """이번 실행에서 더피싱을 조회하지 않는 상태인지 (간격 미도래·꺼짐·실패 후 중단)"""
+        if self.tf_down or not self.st["tf"]["enabled"]:
+            return True     # 꺼져 있으면 /status 로도 조회하지 않음
+        return not (self.tf_due or self.tf_force)
+
+    def _tf_diag(self, ok, sec, err=""):
+        if self.ip is None:
+            self.ip = my_ip()
+        rec = {"t": f"{now_kst():%m-%d %H:%M}", "ok": ok, "sec": round(sec, 1),
+               "ip": self.ip, "err": err[:80]}
+        self.st["tf_diag"].append(rec)
+        self.st["tf_diag"] = self.st["tf_diag"][-TF_DIAG_MAX:]
+        log(f"더피싱 진단: {'성공' if ok else '실패'} / 응답 {rec['sec']}초 / 서버IP {self.ip}"
+            + (f" / {err}" if err else ""))
+
     def thefishing(self, fish, regions, date):
         key = ("TF", fish, tuple(sorted(regions)), date)
         if key in self.cache:
             return self.cache[key]
-        if not self.tf_codes(regions) or out_of_time():
+        if not self.tf_codes(regions) or out_of_time() or self.tf_skipped():
             self.cache[key] = None
             return None
+        if not self.tf_tried:
+            self.tf_tried = True
+            self.st["tf"]["last"] = time.time()
         result = []
+        t0 = time.time()
+        connected = False
         try:
             for page in range(1, 6):
                 self.calls += 1
-                html = http_get(self.tf_url(fish, regions, date, page))
+                html = http_get(self.tf_url(fish, regions, date, page), timeout=TF_TIMEOUT)
+                if page == 1:
+                    connected = True
+                    self._tf_diag(True, time.time() - t0)
                 idx = html.find("re_list re_list_etc")
                 if idx == -1:
                     if page == 1 and "re_list" not in html:
@@ -440,8 +496,12 @@ class Fetcher:
                     break
             self.ok["더피싱"] += 1
         except Exception as e:
-            log(f"더피싱 조회 실패: {type(e).__name__}")
+            if not connected:
+                # 접속 단계 실패만 진단에 기록 (화면 구조 변경 등은 로그로만 남김)
+                self._tf_diag(False, time.time() - t0, err_text(e))
+            log(f"더피싱 조회 실패: {err_text(e)}")
             self.fail["더피싱"] += 1
+            self.tf_down = True   # 막힌 상태면 나머지도 실패하므로 이번 실행은 중단
             self.cache[key] = None
             return None
         self.cache[key] = result
@@ -462,7 +522,7 @@ class Fetcher:
                 self.cache[key] = html
                 self.ok["클럽씨피싱"] += 1
             except Exception as e:
-                log(f"클럽씨피싱 조회 실패: {type(e).__name__}")
+                log(f"클럽씨피싱 조회 실패: {err_text(e)}")
                 self.fail["클럽씨피싱"] += 1
                 self.cache[key] = None
         html = self.cache[key]
@@ -577,11 +637,18 @@ def run_monitor(st, f):
                 if site in failed:
                     now_open[k] = site
             new = [i for i in found if i["key"] not in prev]
-            w["open"] = now_open
             if new:
                 msg = f"🎣 새 빈자리 [{watch_label(w)}]\n\n" + "\n".join(describe(i) for i in new)
-                tg_send(int(uid), msg)
-                sent += len(new)
+                if tg_send(int(uid), msg):
+                    sent += len(new)
+                    u["send_fail"] = 0
+                else:
+                    # 전송 실패(대화 미시작·차단 등) → 다음 실행 때 다시 보내도록 기록하지 않음
+                    for i in new:
+                        now_open.pop(i["key"], None)
+                    u["send_fail"] = u.get("send_fail", 0) + 1
+                    log("알림 전송 실패 1건 (다음 실행에서 재시도)")
+            w["open"] = now_open
     return sent
 
 
@@ -642,6 +709,8 @@ HELP_ADMIN = (
     "/kick ID — 사용자 삭제\n"
     "/pauseall, /resumeall — 전체 조회 정지/재개 (명령 처리는 계속)\n"
     "/health — 사이트 상태\n"
+    "/tf — 더피싱 조회 상태, /tf on·off, /tf 30 (간격 분)\n"
+    "/tfdiag — 더피싱 진단 요약 (성공률·응답시간·서버IP)\n"
     "/notice 내용 — 전체 공지"
 )
 
@@ -750,7 +819,7 @@ def handle(st, f, msg):
 
     # ── 관리자 전용 ──
     if head in ("/approve", "/reject", "/kick", "/users", "/pauseall",
-                "/resumeall", "/health", "/notice"):
+                "/resumeall", "/health", "/notice", "/tf", "/tfdiag"):
         if not is_admin:
             tg_send(uid, "관리자 전용 명령입니다.")
             return
@@ -759,7 +828,58 @@ def handle(st, f, msg):
             for x in st["users"].values():
                 tag = {"active": "", "pending": " [승인대기]"}.get(x["status"], "")
                 ps = " [정지]" if x.get("paused") else ""
-                lines.append(f"- {x['name']} (ID {x['id']}){tag}{ps} 감시 {len(x['watches'])}개")
+                sf = f" [알림 실패 {x['send_fail']}회]" if x.get("send_fail") else ""
+                lines.append(f"- {x['name']} (ID {x['id']}){tag}{ps}{sf} 감시 {len(x['watches'])}개")
+            tg_send(uid, "\n".join(lines))
+        elif head == "/tf":
+            tf = st["tf"]
+            a = arg.lower()
+            if a in ("on", "off"):
+                tf["enabled"] = a == "on"
+                if a == "on":
+                    tf["last"] = 0
+                    for x in st["users"].values():
+                        for w in x["watches"]:
+                            w["open"] = {k: v for k, v in w.get("open", {}).items() if v != "더피싱"}
+            elif a.isdigit() and 10 <= int(a) <= 1440:
+                tf["interval"] = int(a)
+            elif a:
+                tg_send(uid, "사용법: /tf on, /tf off, /tf 30 (10~1440분)")
+                return
+            last = (datetime.fromtimestamp(tf["last"], KST).strftime("%m-%d %H:%M")
+                    if tf.get("last") else "없음")
+            tg_send(uid, f"🎣 더피싱 조회: {'켜짐' if tf['enabled'] else '꺼짐'}\n"
+                         f"간격: {tf['interval']}분 / 마지막 시도: {last}\n"
+                         f"대기 시간: {TF_TIMEOUT}초")
+        elif head == "/tfdiag":
+            d = st["tf_diag"]
+            if not d:
+                tg_send(uid, "아직 더피싱 진단 기록이 없습니다.")
+                return
+            okd = [x for x in d if x["ok"]]
+            bad = [x for x in d if not x["ok"]]
+            lines = [f"🩺 더피싱 진단 (최근 {len(d)}회)",
+                     f"성공 {len(okd)}회 / 실패 {len(bad)}회 ({len(okd) * 100 // len(d)}%)"]
+            if okd:
+                secs = sorted(x["sec"] for x in okd)
+                lines.append(f"성공 시 응답: 최소 {secs[0]}초 / 중간 {secs[len(secs) // 2]}초 / 최대 {secs[-1]}초")
+            if bad:
+                errs = {}
+                for x in bad:
+                    errs[x["err"].split(":")[-1].strip() or "?"] = errs.get(x["err"].split(":")[-1].strip() or "?", 0) + 1
+                lines.append("실패 원인: " + ", ".join(f"{k} {v}회" for k, v in errs.items()))
+            # 서버 IP 앞 두 자리 대역별 성공/실패 (IP 대역 차단 여부 판단용)
+            bands = {}
+            for x in d:
+                b = ".".join(x["ip"].split(".")[:2]) if x["ip"] != "?" else "?"
+                bands.setdefault(b, [0, 0])[0 if x["ok"] else 1] += 1
+            lines.append("\n서버IP 대역별 성공/실패")
+            for b, (o, f_) in sorted(bands.items(), key=lambda kv: -(kv[1][0] + kv[1][1]))[:12]:
+                lines.append(f"- {b}.x.x: 성공 {o} / 실패 {f_}")
+            lines.append("\n최근 5회")
+            for x in d[-5:]:
+                lines.append(f"- {x['t']} {'성공' if x['ok'] else '실패'} {x['sec']}초 {x['ip']}"
+                             + (f" ({x['err']})" if x["err"] else ""))
             tg_send(uid, "\n".join(lines))
         elif head == "/health":
             lines = ["🩺 사이트 상태"]
@@ -873,12 +993,15 @@ def handle(st, f, msg):
             tg_send(uid, "감시 중인 조건이 없습니다.")
             return
         lines = ["🔎 지금 조회한 결과"]
+        f.tf_force = True
         for w in u["watches"]:
             found, failed = watch_matches(f, u, w)
             lines.append(f"\n[{watch_label(w)}] {len(found)}건")
             lines += [describe(i) for i in found]
             if failed:
-                lines.append(f"  (조회 실패: {', '.join(sorted(failed))})")
+                names = ["더피싱(꺼짐)" if x == "더피싱" and not st["tf"]["enabled"] else x
+                         for x in sorted(failed)]
+                lines.append(f"  (조회 안 됨: {', '.join(names)})")
         if st["paused_all"]:
             lines.append("\n※ 현재 관리자가 전체 조회를 정지한 상태라 자동 알림은 오지 않습니다.")
         tg_send(uid, "\n".join(lines))
@@ -969,7 +1092,7 @@ def main():
                 handle(st, f, msg)
                 n_cmd += 1
             except Exception as e:
-                log(f"명령 처리 오류: {type(e).__name__}")
+                log(f"명령 처리 오류: {err_text(e)}")
 
     # 2) 지난 날짜 정리
     cleanup_past(st)
